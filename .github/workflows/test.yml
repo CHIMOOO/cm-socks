@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: shellcheck cm install.sh
+
+      - name: 一键安装（真实的 install.sh 流程，无终端走默认选项）
+        run: sudo bash install.sh
+
+      - name: 换成本次提交的 cm 继续测试
+        run: sudo install -m 755 cm /usr/local/bin/cm
+
+      - name: 再次创建（沿用已有 IPv4）
+        run: sudo cm create
+
+      - name: 全随机创建
+        run: sudo V4_MODE=rand V6_MODE=rand cm create
+
+      - name: 通过代理访问外网
+        run: |
+          sudo cm list
+          url="$(sudo head -n 1 /etc/gost-auto/proxies.txt)"
+          curl -fsS --proxy "socks5h://${url#socks5://}" https://api.ipify.org
+
+      - name: 服务状态
+        run: sudo cm status

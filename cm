@@ -1,0 +1,780 @@
+#!/usr/bin/env bash
+# cm-socks —— GOST 3 SOCKS5 代理一键部署与管理面板
+# https://github.com/CHIMOOO/cm-socks
+#
+#   cm          打开管理面板
+#   cm help     查看全部子命令
+set -euo pipefail
+umask 077
+
+REPO_RAW='https://raw.githubusercontent.com/CHIMOOO/cm-socks/main'
+CM_BIN=/usr/local/bin/cm
+GOST_INSTALL=/usr/local/bin/gost
+DIR=/etc/gost-auto
+CONFIG=$DIR/config.json
+SETTINGS=$DIR/cm.conf
+PROXIES=$DIR/proxies.txt
+SERVICE=/etc/systemd/system/gost.service
+RAND_PORT_MIN=20000
+RAND_PORT_MAX=60000
+
+if [[ -t 2 ]]; then
+    RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' CYAN=$'\e[36m' BOLD=$'\e[1m' RESET=$'\e[0m'
+else
+    RED='' GREEN='' YELLOW='' CYAN='' BOLD='' RESET=''
+fi
+
+fail() { printf '%s%s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
+warn() { printf '%s%s%s\n' "$YELLOW" "$*" "$RESET" >&2; }
+info() { printf '%s%s%s\n' "$GREEN" "$*" "$RESET" >&2; }
+
+need_root() { [[ $EUID -eq 0 ]] || fail '请使用 root 执行'; }
+
+# 脚本可能经由管道运行，所以从 /dev/tty 读键盘输入；没有终端时返回空，即选默认项。
+ask() {
+    local answer=''
+    printf '%s' "$1" >&2
+    if ! { read -r answer < /dev/tty; } 2>/dev/null; then
+        printf '（无终端，使用默认值）\n' >&2
+    fi
+    printf '%s' "$answer"
+}
+
+valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )); }
+valid_user() { [[ $1 =~ ^[^[:space:]:]{1,255}$ ]]; }
+valid_pass() { [[ $1 =~ ^[^[:space:]]{1,255}$ ]]; }
+
+rand_token() {
+    python3 -c 'import secrets, string, sys
+alphabet = string.ascii_letters + string.digits
+print("".join(secrets.choice(alphabet) for _ in range(int(sys.argv[1]))))' "$1"
+}
+
+# 随机选一个当前没有在监听的端口。
+rand_port() {
+    ss -Hltn | python3 -c 'import secrets, sys
+low, high = int(sys.argv[1]), int(sys.argv[2])
+used = set()
+for line in sys.stdin:
+    fields = line.split()
+    if len(fields) >= 4 and fields[3].rsplit(":", 1)[-1].isdigit():
+        used.add(int(fields[3].rsplit(":", 1)[-1]))
+print(secrets.choice([p for p in range(low, high + 1) if p not in used]))' \
+        "$RAND_PORT_MIN" "$RAND_PORT_MAX"
+}
+
+install_deps() {
+    command -v systemctl >/dev/null || fail '需要使用 systemd 的 Linux 系统'
+    local manager='' pkgs=()
+    if command -v apt-get >/dev/null; then
+        manager=apt
+    elif command -v dnf >/dev/null; then
+        manager=dnf
+    elif command -v yum >/dev/null; then
+        manager=yum
+    fi
+    command -v curl >/dev/null || pkgs+=(curl)
+    command -v python3 >/dev/null || pkgs+=(python3)
+    command -v tar >/dev/null || pkgs+=(tar)
+    command -v gzip >/dev/null || pkgs+=(gzip)
+    if ! command -v ip >/dev/null || ! command -v ss >/dev/null; then
+        if [[ $manager == apt ]]; then pkgs+=(iproute2); else pkgs+=(iproute); fi
+    fi
+    (( ${#pkgs[@]} )) || return 0
+
+    info "安装依赖：${pkgs[*]}"
+    case $manager in
+        apt)
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" ca-certificates
+            ;;
+        dnf|yum) "$manager" install -y -q "${pkgs[@]}" ;;
+        *) fail "无法自动安装依赖，请手动安装：${pkgs[*]}" ;;
+    esac
+}
+
+# 读取现有配置里的 IPv4 代理（端口、账号、密码）。
+read_old_v4() {
+    OLD_V4=''
+    [[ -f $CONFIG ]] || return 0
+    OLD_V4="$(python3 - "$CONFIG" <<'PY'
+import ipaddress
+import json
+import sys
+try:
+    with open(sys.argv[1]) as f:
+        config = json.load(f)
+except (OSError, ValueError):
+    sys.exit(0)
+for service in config.get("services", []):
+    try:
+        ipaddress.IPv4Address(service["metadata"]["interface"])
+        auth = service["handler"]["auth"]
+        port = int(service["addr"].rsplit(":", 1)[1])
+        user, password = auth["username"], auth["password"]
+    except (KeyError, TypeError, ValueError, IndexError):
+        continue
+    print(f"{port}\t{user}\t{password}")
+    break
+PY
+)"
+}
+
+save_settings() {
+    install -d -m 700 "$DIR"
+    {
+        printf '# cm-socks 统一账号与端口，可用 cm account 修改\n'
+        printf 'UNI_USER=%q\nUNI_PASS=%q\nV4_PORT=%q\nV6_START=%q\n' \
+            "$UNI_USER" "$UNI_PASS" "$V4_PORT" "$V6_START"
+    } > "$SETTINGS.tmp"
+    mv -f "$SETTINGS.tmp" "$SETTINGS"
+}
+
+# 统一账号与端口，供「统一」「顺序」模式使用，只保存在本机 $SETTINGS。
+# 首次运行时：已有旧配置就沿用旧 IPv4 代理的端口和账号，否则随机生成。
+# 环境变量 CM_USER / CM_PASS / CM_PORT / CM_V6_PORT 可指定。创建成功后才保存。
+load_settings() {
+    UNI_USER='' UNI_PASS='' V4_PORT='' V6_START=''
+    if [[ -f $SETTINGS ]]; then
+        # shellcheck source=/dev/null
+        source "$SETTINGS"
+    elif [[ -n ${OLD_V4:-} ]]; then
+        IFS=$'\t' read -r V4_PORT UNI_USER UNI_PASS <<< "$OLD_V4"
+    fi
+    UNI_USER=${CM_USER:-$UNI_USER}
+    UNI_PASS=${CM_PASS:-$UNI_PASS}
+    V4_PORT=${CM_PORT:-$V4_PORT}
+    V6_START=${CM_V6_PORT:-$V6_START}
+    [[ -n $UNI_USER ]] || UNI_USER="u$(rand_token 9)"
+    [[ -n $UNI_PASS ]] || UNI_PASS="$(rand_token 20)"
+    [[ -n $V4_PORT ]] || V4_PORT="$(rand_port)"
+    [[ -n $V6_START ]] || V6_START=$((V4_PORT + 20))
+    valid_user "$UNI_USER" || fail "账号不合法（不能含空格或冒号）：$UNI_USER"
+    valid_pass "$UNI_PASS" || fail '密码不合法（不能含空格）'
+    valid_port "$V4_PORT" || fail "IPv4 端口不合法：$V4_PORT"
+    valid_port "$V6_START" || fail "IPv6 起始端口不合法：$V6_START"
+}
+
+cmd_install() {
+    install_deps
+
+    local arch tag current work url
+    case "$(uname -m)" in
+        x86_64|amd64)   arch=amd64 ;;
+        aarch64|arm64)  arch=arm64 ;;
+        armv7*)         arch=armv7 ;;
+        i?86)           arch=386 ;;
+        *)              fail "不支持的 CPU 架构：$(uname -m)" ;;
+    esac
+
+    # 通过 releases/latest 的跳转拿版本号，避开 GitHub API 的频率限制。
+    tag=${GOST_VERSION:-}
+    if [[ -z $tag ]]; then
+        tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+            https://github.com/go-gost/gost/releases/latest)" ||
+            fail '无法获取 GOST 最新版本'
+        tag=${tag##*/}
+    fi
+    [[ $tag == v3.* ]] || fail "无法识别的 GOST 版本：$tag"
+
+    if [[ -x $GOST_INSTALL ]]; then
+        current="$("$GOST_INSTALL" -V 2>&1 || true)"
+        if [[ " $current " == *" $tag "* ]]; then
+            info "GOST 已是最新版本：$current"
+            return 0
+        fi
+    fi
+
+    work="$(mktemp -d)"
+    url="https://github.com/go-gost/gost/releases/download/${tag}/gost_${tag#v}_linux_${arch}.tar.gz"
+    info "下载 GOST ${tag}（${arch}）"
+    if ! curl -fL --retry 3 -o "$work/gost.tar.gz" "$url" ||
+        ! tar -xzf "$work/gost.tar.gz" -C "$work" gost; then
+        rm -rf -- "$work"
+        fail "下载或解压失败：$url"
+    fi
+    # 先写临时文件再改名，正在运行的 gost 不受影响。
+    install -m 755 "$work/gost" "$GOST_INSTALL.new"
+    mv -f "$GOST_INSTALL.new" "$GOST_INSTALL"
+    rm -rf -- "$work"
+    info "已安装：$("$GOST_INSTALL" -V 2>&1)"
+
+    if systemctl is-active --quiet gost.service; then
+        systemctl restart gost.service
+        info '已重启 gost 服务'
+    fi
+}
+
+cmd_create() {
+    install_deps
+    command -v gost >/dev/null || cmd_install
+    local gost_bin version
+    gost_bin="$(command -v gost)"
+    version="$("$gost_bin" -V 2>&1 || true)"
+    [[ $version =~ (^|[[:space:]])v?3\. ]] ||
+        fail "需要 GOST 3，当前版本：${version}（可执行 cm install 升级）"
+
+    WORK="$(mktemp -d)"
+    trap 'rm -rf -- "$WORK"' EXIT
+
+    read_old_v4
+    load_settings
+
+    # 本机 IPv4 出口、可用的公网 IPv6、已在监听的 TCP 端口、公网 IPv4。
+    ip -j -4 route get 1.1.1.1 > "$WORK/route.json"
+    ip -j -6 addr show scope global > "$WORK/ipv6.json"
+    ss -Hltnp > "$WORK/listen.txt"
+
+    local v6_count url
+    v6_count="$(python3 - "$WORK" <<'PY'
+import ipaddress
+import json
+import sys
+from pathlib import Path
+
+work = Path(sys.argv[1])
+addresses = set()
+for interface in json.loads((work / "ipv6.json").read_text()):
+    for info in interface.get("addr_info", []):
+        flags = set(info.get("flags", []))
+        rejected = ("temporary", "tentative", "dadfailed", "deprecated")
+        if any(info.get(flag) or flag in flags for flag in rejected):
+            continue
+        if info.get("preferred_life_time") == 0:
+            continue
+        address = ipaddress.IPv6Address(info["local"])
+        if address in ipaddress.IPv6Network("2000::/3") and address.is_global:
+            addresses.add(address)
+(work / "ipv6.txt").write_text("".join(f"{a}\n" for a in sorted(addresses)))
+print(len(addresses))
+PY
+)"
+
+    SERVER_IP=''
+    for url in https://api.ipify.org https://ipv4.icanhazip.com; do
+        if SERVER_IP="$(curl --noproxy '*' -4 -fsS \
+            --connect-timeout 5 --max-time 15 "$url")"; then
+            break
+        fi
+    done
+    [[ -n $SERVER_IP ]] || fail '无法获取公网 IPv4'
+
+    printf '\n%s公网 IPv4：%s    可用 IPv6：%s 个%s\n\n' \
+        "$CYAN" "${SERVER_IP//[[:space:]]/}" "$v6_count" "$RESET" >&2
+
+    # 也可以预先指定：V4_MODE=keep|fixed|rand  V6_MODE=seq|rand  ENTRY=v6|v4
+    local answer old_port old_user
+    V4_MODE="${V4_MODE:-}"
+    if [[ -n $OLD_V4 && -z $V4_MODE ]]; then
+        IFS=$'\t' read -r old_port old_user _ <<< "$OLD_V4"
+        answer="$(ask "检测到已有 IPv4 代理：端口 ${old_port}，账号 ${old_user}
+是否重置？
+  1) 不重置：沿用原来的端口和账号密码
+  2) 重置：重新选择统一或随机
+请输入 1 或 2 [默认 1]：")"
+        case "$answer" in
+            ''|1)  V4_MODE=keep ;;
+            2)     ;;
+            *)     fail "未知选项：$answer" ;;
+        esac
+    fi
+    if [[ -z $V4_MODE ]]; then
+        V4_MODE="$(ask "请选择 IPv4 代理的分配方式：
+  1) 统一：端口 ${V4_PORT}，账号 ${UNI_USER}（可用 cm account 修改）
+  2) 随机：随机端口和随机账号密码
+请输入 1 或 2 [默认 1]：")"
+    fi
+    case "$V4_MODE" in
+        keep)        [[ -n $OLD_V4 ]] || fail '没有可沿用的 IPv4 代理' ;;
+        ''|1|fixed)  V4_MODE=fixed ;;
+        2|rand)      V4_MODE=rand ;;
+        *)           fail "未知选项：$V4_MODE" ;;
+    esac
+
+    V6_MODE="${V6_MODE:-}"
+    ENTRY="${ENTRY:-}"
+    if (( v6_count > 0 )); then
+        if [[ -z $V6_MODE ]]; then
+            V6_MODE="$(ask "请选择 IPv6 代理的分配方式：
+  1) 顺序：端口从 ${V6_START} 递增，账号密码与统一账号相同
+  2) 随机：每个 IPv6 使用随机端口和随机账号密码
+请输入 1 或 2 [默认 1]：")"
+        fi
+        if [[ -z $ENTRY ]]; then
+            ENTRY="$(ask "请选择 IPv6 代理的连接地址：
+  1) IPv6：用每条代理自己的 IPv6 连接，进出同一个 IPv6（客户端需要有 IPv6 网络）
+  2) IPv4：统一用服务器公网 IPv4 连接，出口仍是各自的 IPv6
+请输入 1 或 2 [默认 1]：")"
+        fi
+    fi
+    case "$V6_MODE" in
+        ''|1|seq)  V6_MODE=seq ;;
+        2|rand)    V6_MODE=rand ;;
+        *)         fail "未知选项：$V6_MODE" ;;
+    esac
+    case "$ENTRY" in
+        ''|1|v6)  ENTRY=v6 ;;
+        2|v4)     ENTRY=v4 ;;
+        *)        fail "未知选项：$ENTRY" ;;
+    esac
+
+    export SERVER_IP WORK V4_MODE V6_MODE ENTRY OLD_V4 \
+        UNI_USER UNI_PASS V4_PORT V6_START RAND_PORT_MIN RAND_PORT_MAX
+
+    # 生成 GOST 3 配置和端口/入口/出口/账号映射。
+    python3 <<'PY'
+import ipaddress
+import json
+import os
+import secrets
+import string
+from pathlib import Path
+
+work = Path(os.environ["WORK"])
+v4_mode = os.environ["V4_MODE"]
+v6_mode = os.environ["V6_MODE"]
+entry = os.environ["ENTRY"]
+uni_user = os.environ["UNI_USER"]
+uni_pass = os.environ["UNI_PASS"]
+public = ipaddress.IPv4Address(os.environ["SERVER_IP"].strip())
+route = json.loads((work / "route.json").read_text())[0]
+source4 = str(ipaddress.IPv4Address(route["prefsrc"]))
+ipv6 = [
+    ipaddress.IPv6Address(line)
+    for line in (work / "ipv6.txt").read_text().split()
+]
+
+rng = secrets.SystemRandom()
+alphabet = string.ascii_letters + string.digits
+
+def token(n):
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+def random_creds():
+    return "u" + token(9), token(20)
+
+# 被其它程序占用的端口。GOST 自己占用的端口重启时会释放，不算在内。
+busy = set()
+for line in (work / "listen.txt").read_text().splitlines():
+    fields = line.split()
+    if len(fields) < 4 or '"gost"' in line:
+        continue
+    port = fields[3].rsplit(":", 1)[-1]
+    if port.isdigit():
+        busy.add(int(port))
+
+# 已确定的端口，随机端口和顺序端口都要避开。
+reserved = set()
+if v4_mode == "keep":
+    old_port, old_user, old_pass = os.environ["OLD_V4"].split("\t", 2)
+    v4_port = int(old_port)
+elif v4_mode == "fixed":
+    v4_port = int(os.environ["V4_PORT"])
+if v4_mode != "rand":
+    if v4_port in busy:
+        raise SystemExit(f"端口 {v4_port} 已被其它程序占用，可用 cm account 换一个")
+    reserved.add(v4_port)
+
+seq_ports = []
+if v6_mode == "seq":
+    port = int(os.environ["V6_START"])
+    while len(seq_ports) < len(ipv6):
+        if port > 65535:
+            raise SystemExit("IPv6 数量超过可分配端口范围")
+        if port not in reserved and port not in busy:
+            seq_ports.append(port)
+        port += 1
+    reserved.update(seq_ports)
+
+need = (1 if v4_mode == "rand" else 0) + (len(ipv6) if v6_mode == "rand" else 0)
+random_ports = []
+if need:
+    low = int(os.environ["RAND_PORT_MIN"])
+    high = int(os.environ["RAND_PORT_MAX"])
+    candidates = [
+        p for p in range(low, high + 1) if p not in reserved and p not in busy
+    ]
+    if len(candidates) < need:
+        raise SystemExit("可用随机端口不足")
+    random_ports = rng.sample(candidates, need)
+
+if v4_mode == "keep":
+    pairs = [(v4_port, source4, "ipv4", old_user, old_pass)]
+elif v4_mode == "fixed":
+    pairs = [(v4_port, source4, "ipv4", uni_user, uni_pass)]
+else:
+    pairs = [(random_ports.pop(), source4, "ipv4", *random_creds())]
+
+if v6_mode == "seq":
+    pairs += [
+        (port, str(addr), "ipv6", uni_user, uni_pass)
+        for port, addr in zip(seq_ports, ipv6)
+    ]
+else:
+    rng.shuffle(ipv6)
+    pairs += [
+        (random_ports.pop(), str(addr), "ipv6", *random_creds())
+        for addr in ipv6
+    ]
+
+def v6_entry(family):
+    return family == "ipv6" and entry == "v6"
+
+def listen_host(source, family):
+    # GOST 监听地址：IPv6 入口只监听这条代理自己的 IPv6。
+    return f"[{source}]" if v6_entry(family) else "0.0.0.0"
+
+def test_host(source, family):
+    # 本机验证时连接的地址。
+    return f"[{source}]" if v6_entry(family) else "127.0.0.1"
+
+def show_host(source, family):
+    # 输出给客户端的连接地址。
+    return f"[{source}]" if v6_entry(family) else str(public)
+
+config = {
+    "services": [
+        {
+            "name": f"socks-{port}",
+            "addr": f"{listen_host(source, family)}:{port}",
+            "handler": {
+                "type": "socks5",
+                "auth": {"username": user, "password": password},
+            },
+            "listener": {"type": "tcp"},
+            "metadata": {"interface": source},
+            "resolver": family,
+        }
+        for port, source, family, user, password in pairs
+    ],
+    "resolvers": [
+        {
+            "name": family,
+            "nameservers": [
+                {"addr": "1.1.1.1:53", "only": family},
+                {"addr": "8.8.8.8:53", "only": family},
+            ],
+        }
+        for family in ("ipv4", "ipv6")
+    ],
+}
+
+(work / "config.json").write_text(json.dumps(config, indent=2))
+(work / "ports.tsv").write_text("".join(
+    "\t".join([
+        str(port),
+        test_host(source, family),
+        show_host(source, family),
+        str(public) if family == "ipv4" else source,
+        family,
+        user,
+        password,
+    ]) + "\n"
+    for port, source, family, user, password in pairs
+))
+PY
+
+    save_settings
+    [[ ! -f $CONFIG ]] || cp -p "$CONFIG" "$CONFIG.bak"
+    [[ ! -f $SERVICE ]] || cp -p "$SERVICE" "$DIR/gost.service.bak"
+    install -m 600 "$WORK/config.json" "$CONFIG"
+
+    # 停用旧版脚本按端口创建的实例（gost-<端口>.service），避免端口冲突。
+    local unit name
+    for unit in /etc/systemd/system/gost-*.service; do
+        name="${unit##*/}"
+        [[ $name =~ ^gost-[0-9]+\.service$ ]] || continue
+        systemctl disable --now "$name" >/dev/null 2>&1 || fail "无法停用 $name"
+    done
+
+    cat > "$SERVICE" <<EOF
+[Unit]
+Description=GOST IPv4 and IPv6 SOCKS5 proxies
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart="${gost_bin}" -C ${CONFIG}
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 644 "$SERVICE"
+    systemctl daemon-reload
+    systemctl enable gost.service >/dev/null 2>&1
+    systemctl restart gost.service
+    sleep 2
+    systemctl is-active --quiet gost.service ||
+        fail 'GOST 启动失败：journalctl -u gost.service -n 50 --no-pager'
+
+    # 只列出经本机 SOCKS5 连接测试、且出口地址匹配的代理。
+    local port test_host show_host expected family user pass endpoint actual
+    : > "$WORK/proxies.txt"
+    while IFS=$'\t' read -r port test_host show_host expected family user pass; do
+        if [[ $family == ipv4 ]]; then
+            endpoint='https://api.ipify.org'
+        else
+            endpoint='https://api6.ipify.org'
+        fi
+
+        actual=''
+        for _ in 1 2 3; do
+            if actual="$(curl --noproxy '' -fsS \
+                --connect-timeout 5 --max-time 15 \
+                --proxy "socks5h://${test_host}:${port}" \
+                --proxy-user "${user}:${pass}" \
+                "$endpoint" 2>/dev/null)"; then
+                break
+            fi
+            sleep 1
+        done
+
+        if ! python3 - "$expected" "$actual" <<'PY'
+import ipaddress
+import sys
+try:
+    matched = ipaddress.ip_address(sys.argv[1]) == ipaddress.ip_address(sys.argv[2].strip())
+except ValueError:
+    matched = False
+sys.exit(0 if matched else 1)
+PY
+        then
+            warn "端口 ${port} 验证失败，未列出"
+            continue
+        fi
+
+        python3 - "$show_host" "$port" "$user" "$pass" <<'PY' | tee -a "$WORK/proxies.txt"
+import sys
+from urllib.parse import quote
+host, port, user, password = sys.argv[1:5]
+print(f"socks5://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}")
+PY
+    done < "$WORK/ports.tsv"
+
+    install -m 600 "$WORK/proxies.txt" "$PROXIES"
+    [[ -s $PROXIES ]] || warn '没有代理通过验证，请查看日志：cm log'
+    printf '\n代理列表已保存到 %s，随时可用 cm list 查看\n' "$PROXIES" >&2
+}
+
+cmd_list() {
+    [[ -s $PROXIES ]] || fail '还没有代理，请先创建：cm create'
+    cat "$PROXIES"
+}
+
+cmd_account() {
+    read_old_v4
+    load_settings
+    printf '当前统一账号：\n  账号：%s\n  密码：%s\n  IPv4 端口：%s\n  IPv6 起始端口：%s\n\n' \
+        "$UNI_USER" "$UNI_PASS" "$V4_PORT" "$V6_START" >&2
+    printf '直接回车保持不变，输入 r 随机生成\n' >&2
+
+    local value
+    value="$(ask '账号：')"
+    case "$value" in
+        '')   ;;
+        r|R)  UNI_USER="u$(rand_token 9)" ;;
+        *)    valid_user "$value" || fail '账号不能含空格或冒号'; UNI_USER=$value ;;
+    esac
+    value="$(ask '密码：')"
+    case "$value" in
+        '')   ;;
+        r|R)  UNI_PASS="$(rand_token 20)" ;;
+        *)    valid_pass "$value" || fail '密码不能含空格'; UNI_PASS=$value ;;
+    esac
+    value="$(ask 'IPv4 端口：')"
+    case "$value" in
+        '')   ;;
+        r|R)  V4_PORT="$(rand_port)" ;;
+        *)    valid_port "$value" || fail "端口不合法：$value"; V4_PORT=$value ;;
+    esac
+    value="$(ask 'IPv6 起始端口：')"
+    case "$value" in
+        '')   ;;
+        r|R)  V6_START="$(rand_port)" ;;
+        *)    valid_port "$value" || fail "端口不合法：$value"; V6_START=$value ;;
+    esac
+    save_settings
+    info "已保存到 $SETTINGS"
+
+    value="$(ask '现在重建代理使其生效？[Y/n]：')"
+    case "$value" in
+        ''|y|Y) V4_MODE=${V4_MODE:-fixed}; cmd_create ;;
+        *)      printf '稍后可执行 cm create 重建\n' >&2 ;;
+    esac
+}
+
+need_config() { [[ -f $SERVICE ]] || fail '还没有创建代理：cm create'; }
+
+cmd_status() { systemctl status gost.service --no-pager || true; }
+
+cmd_restart() {
+    need_config
+    systemctl restart gost.service
+    sleep 1
+    systemctl is-active --quiet gost.service || fail '启动失败，请查看日志：cm log'
+    info 'gost 服务已重启'
+}
+
+cmd_stop() {
+    systemctl stop gost.service
+    info 'gost 服务已停止'
+}
+
+cmd_log() { journalctl -u gost.service -n 50 --no-pager || true; }
+
+cmd_update() {
+    local tmp
+    tmp="$(mktemp)"
+    if ! curl -fsSL "$REPO_RAW/cm" -o "$tmp" || ! bash -n "$tmp"; then
+        rm -f -- "$tmp"
+        fail '下载或校验 cm 失败'
+    fi
+    # 先写临时文件再改名，正在运行的面板不受影响。
+    install -m 755 "$tmp" "$CM_BIN.new"
+    mv -f "$CM_BIN.new" "$CM_BIN"
+    rm -f -- "$tmp"
+    info 'cm 已更新到最新版'
+}
+
+cmd_uninstall() {
+    local answer
+    answer="$(ask "确认卸载？将停止 gost 服务并删除服务、${DIR}（含全部代理账号）和 cm 命令 [y/N]：")"
+    [[ $answer == [yY] ]] || { printf '已取消\n' >&2; return 0; }
+    systemctl disable --now gost.service >/dev/null 2>&1 || true
+    rm -f -- "$SERVICE"
+    systemctl daemon-reload
+    rm -rf -- "$DIR"
+    answer="$(ask "是否同时删除 gost 程序 $(command -v gost || echo "$GOST_INSTALL")？[y/N]：")"
+    if [[ $answer == [yY] ]]; then
+        rm -f -- "$(command -v gost || echo "$GOST_INSTALL")"
+    fi
+    rm -f -- "$CM_BIN"
+    info '已卸载'
+}
+
+usage() {
+    cat <<EOF
+cm-socks —— GOST 3 SOCKS5 代理部署与管理面板
+
+用法：cm [命令]
+  (无)        打开管理面板
+  install     安装依赖和 GOST（已是最新则跳过）
+  create      创建 / 重建 SOCKS5 代理
+  list        查看代理列表
+  account     修改统一账号 / 端口
+  status      服务状态
+  restart     重启服务
+  stop        停止服务
+  log         查看最近日志
+  update      更新 cm 到最新版
+  uninstall   卸载
+
+免交互创建（环境变量）：
+  V4_MODE=keep|fixed|rand   IPv4：沿用 / 统一账号 / 随机
+  V6_MODE=seq|rand          IPv6：顺序端口 + 统一账号 / 随机
+  ENTRY=v6|v4               IPv6 代理的连接地址
+  CM_USER  CM_PASS  CM_PORT  CM_V6_PORT
+                            指定统一账号、密码、IPv4 端口、IPv6 起始端口
+  例：V4_MODE=rand V6_MODE=rand cm create
+EOF
+}
+
+header() {
+    local out ver='未安装' state count=0
+    if command -v gost >/dev/null; then
+        out="$(gost -V 2>&1 || true)"
+        read -r _ ver _ <<< "$out"
+    fi
+    if systemctl is-active --quiet gost.service; then
+        state="${GREEN}运行中${RESET}"
+    else
+        state="${RED}未运行${RESET}"
+    fi
+    if [[ -f $PROXIES ]]; then
+        count="$(grep -c . "$PROXIES" || true)"
+    fi
+    printf '\033[H\033[2J' >&2
+    cat >&2 <<EOF
+${CYAN}${BOLD}========================================
+   cm-socks  ·  GOST SOCKS5 管理面板
+========================================${RESET}
+   GOST：${ver:-未知}    服务：${state}    代理：${count} 条
+----------------------------------------
+   1) 安装 / 更新 GOST
+   2) 创建 / 重建 SOCKS5 代理
+   3) 查看代理列表
+   4) 修改统一账号 / 端口
+   5) 服务状态
+   6) 重启服务
+   7) 停止服务
+   8) 查看日志
+   9) 更新 cm 面板
+  10) 卸载
+   0) 退出
+----------------------------------------
+EOF
+}
+
+# 在子 shell 里执行，出错只结束当前操作，回到菜单。
+run() {
+    set +e
+    ( set -e; "$@" )
+    RC=$?
+    set -e
+    (( RC == 0 )) || warn "操作未完成（退出码 ${RC}）"
+}
+
+menu() {
+    { : < /dev/tty; } 2>/dev/null || fail '面板需要在终端中运行，子命令见 cm help'
+    local choice
+    while true; do
+        header
+        choice="$(ask '请选择：')"
+        printf '\n' >&2
+        case "$choice" in
+            1)  run cmd_install ;;
+            2)  run cmd_create ;;
+            3)  run cmd_list ;;
+            4)  run cmd_account ;;
+            5)  run cmd_status ;;
+            6)  run cmd_restart ;;
+            7)  run cmd_stop ;;
+            8)  run cmd_log ;;
+            9)  run cmd_update
+                if (( RC == 0 )); then exec "$CM_BIN"; fi ;;
+            10) run cmd_uninstall
+                if [[ ! -e $CM_BIN ]]; then exit 0; fi ;;
+            0|q|Q) exit 0 ;;
+            *)  warn "无效选项：$choice" ;;
+        esac
+        ask $'\n按回车返回菜单…' >/dev/null
+    done
+}
+
+main() {
+    case "${1:-}" in
+        help|-h|--help)  usage; return ;;
+    esac
+    need_root
+    case "${1:-}" in
+        '')         menu ;;
+        install)    cmd_install ;;
+        create)     cmd_create ;;
+        list)       cmd_list ;;
+        account)    cmd_account ;;
+        status)     cmd_status ;;
+        restart)    cmd_restart ;;
+        stop)       cmd_stop ;;
+        log)        cmd_log ;;
+        update)     cmd_update ;;
+        uninstall)  cmd_uninstall ;;
+        *)          usage >&2; exit 1 ;;
+    esac
+}
+
+main "$@"
