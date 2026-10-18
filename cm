@@ -29,6 +29,7 @@ warn() { printf '%s%s%s\n' "$YELLOW" "$*" "$RESET" >&2; }
 info() { printf '%s%s%s\n' "$GREEN" "$*" "$RESET" >&2; }
 
 need_root() { [[ $EUID -eq 0 ]] || fail '请使用 root 执行'; }
+need_tty() { { : < /dev/tty; } 2>/dev/null || fail "$1"; }
 
 # 脚本可能经由管道运行，所以从 /dev/tty 读键盘输入；没有终端时返回空，即选默认项。
 ask() {
@@ -567,6 +568,7 @@ cmd_list() {
 }
 
 cmd_account() {
+    need_tty '修改账号需要在终端中运行；免交互可用 CM_USER=… CM_PASS=… CM_PORT=… cm create'
     read_old_v4
     load_settings
     printf '当前统一账号：\n  账号：%s\n  密码：%s\n  IPv4 端口：%s\n  IPv6 起始端口：%s\n\n' \
@@ -730,7 +732,7 @@ run() {
 }
 
 menu() {
-    { : < /dev/tty; } 2>/dev/null || fail '面板需要在终端中运行，子命令见 cm help'
+    need_tty '面板需要在终端中运行，子命令见 cm help'
     local choice
     while true; do
         header
