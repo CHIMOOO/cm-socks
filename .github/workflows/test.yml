@@ -9,7 +9,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: ShellCheck
         run: shellcheck cm install.sh
@@ -26,11 +26,13 @@ jobs:
       - name: 全随机创建
         run: sudo V4_MODE=rand V6_MODE=rand cm create
 
+      # 云主机连不回自己的公网 IP，所以从本机 127.0.0.1 连接。
       - name: 通过代理访问外网
         run: |
           sudo cm list
           url="$(sudo head -n 1 /etc/gost-auto/proxies.txt)"
-          curl -fsS --proxy "socks5h://${url#socks5://}" https://api.ipify.org
+          auth="${url#socks5://}"
+          curl -fsS --proxy "socks5h://${auth%@*}@127.0.0.1:${url##*:}" https://api.ipify.org
 
       - name: 服务状态
         run: sudo cm status
