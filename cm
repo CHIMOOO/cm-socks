@@ -7,7 +7,7 @@
 set -euo pipefail
 umask 077
 
-REPO_RAW='https://raw.githubusercontent.com/CHIMOOO/cm-socks/main'
+REPO=CHIMOOO/cm-socks
 CM_BIN=/usr/local/bin/cm
 GOST_INSTALL=/usr/local/bin/gost
 DIR=/etc/gost-auto
@@ -632,10 +632,18 @@ cmd_stop() {
 
 cmd_log() { journalctl -u gost.service -n 50 --no-pager || true; }
 
+# 从最新 Release 的标签下载：main 分支的 raw 地址有 5 分钟 CDN 缓存，刚推送的修复拿不到。
+latest_ref() {
+    local tag
+    tag="$(curl -fsSL --max-time 15 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
+        sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p')" || true
+    printf '%s\n' "${tag:-main}"
+}
+
 cmd_update() {
     local tmp
     tmp="$(mktemp)"
-    if ! curl -fsSL "$REPO_RAW/cm" -o "$tmp" || ! bash -n "$tmp"; then
+    if ! curl -fsSL "https://raw.githubusercontent.com/$REPO/$(latest_ref)/cm" -o "$tmp" || ! bash -n "$tmp"; then
         rm -f -- "$tmp"
         fail '下载或校验 cm 失败'
     fi

@@ -6,8 +6,16 @@
 # 免交互示例：V4_MODE=rand V6_MODE=rand ENTRY=v6 bash <(curl -fsSL ...)
 set -euo pipefail
 
-REPO_RAW='https://raw.githubusercontent.com/CHIMOOO/cm-socks/main'
+REPO=CHIMOOO/cm-socks
 CM_BIN=/usr/local/bin/cm
+
+# 从最新 Release 的标签下载：main 分支的 raw 地址有 5 分钟 CDN 缓存，刚推送的修复拿不到。
+latest_ref() {
+    local tag
+    tag="$(curl -fsSL --max-time 15 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
+        sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p')" || true
+    printf '%s\n' "${tag:-main}"
+}
 
 # 整个脚本包在函数里，下载不完整时不会执行半截。
 main() {
@@ -28,7 +36,7 @@ main() {
 
     tmp="$(mktemp)"
     trap 'rm -f -- "$tmp"' EXIT
-    curl -fsSL "$REPO_RAW/cm" -o "$tmp"
+    curl -fsSL "https://raw.githubusercontent.com/$REPO/$(latest_ref)/cm" -o "$tmp"
     bash -n "$tmp"
     install -m 755 "$tmp" "$CM_BIN.new"
     mv -f "$CM_BIN.new" "$CM_BIN"
