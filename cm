@@ -241,6 +241,9 @@ for interface in json.loads((work / "ipv6.json").read_text()):
         rejected = ("temporary", "tentative", "dadfailed", "deprecated")
         if any(info.get(flag) or flag in flags for flag in rejected):
             continue
+        # 旧版 iproute2 会给被 scope 过滤掉的地址输出空对象 {}
+        if info.get("family") != "inet6" or "local" not in info:
+            continue
         if info.get("preferred_life_time") == 0:
             continue
         address = ipaddress.IPv6Address(info["local"])
